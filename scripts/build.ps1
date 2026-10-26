@@ -35,8 +35,34 @@ Write-Host "Official application root: $Source"
 Copy-Item -Path (Join-Path $Source '*') -Destination $Program -Recurse -Force
 $DcExe = Join-Path $Program 'doublecmd.exe'
 if (!(Test-Path -LiteralPath $DcExe)) { throw 'Official doublecmd.exe missing after packaging.' }
-# Keep the official settings/doublecmd.inf and package contents intact. The root launcher
-# supplies --config-dir pointing to Data/Config so binaries can be replaced independently.
+# Keep the official settings/doublecmd.inf, but move the five application-controlled
+# mutable resource folders to a read-only baseline alongside the executable. The launcher
+# merges this baseline into Data without overwriting user additions, then links the actual
+# program-relative folder paths back to Data. Only the generated App can be replaced on upgrade.
+$Bundled = Join-Path $Program '_BundledAssets'
+New-Item -ItemType Directory -Force -Path $Bundled | Out-Null
+$UserFolders = @{
+    'plugins'      = 'Plugins'
+    'pixmaps'      = 'CustomIcons'
+    'highlighters' = 'Highlighters'
+    'scripts'      = 'Scripts'
+    'cache'        = 'Cache'
+}
+foreach ($Name in $UserFolders.Keys) {
+    $Original = Join-Path $Program $Name
+    if (Test-Path -LiteralPath $Original) {
+        if (!(Test-Path -LiteralPath $Original -PathType Container)) {
+            throw "Expected a directory for managed resource '$Name': $Original"
+        }
+        Move-Item -LiteralPath $Original -Destination (Join-Path $Bundled $Name)
+    }
+    $DataFolder = Join-Path $Portable ("Data\" + $UserFolders[$Name])
+    New-Item -ItemType Directory -Force -Path $DataFolder | Out-Null
+    Set-Content -LiteralPath (Join-Path $DataFolder '.keep') -Value '' -NoNewline -Encoding ASCII
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $Portable 'Data\State'), (Join-Path $Portable 'Data\LegacyAppFolders') | Out-Null
+# The original settings/doublecmd.inf stays in App as a fallback. The launcher overrides
+# settings with --config-dir so ordinary configuration is always in Data\Config.
 
 # Extract the actual, installed application's icon, not a generic replacement.
 Add-Type -AssemblyName System.Drawing
@@ -88,8 +114,11 @@ Start=DoubleCommanderPortable.exe
 Set-Content -LiteralPath (Join-Path $AppInfo 'appinfo.ini') -Value $Ini -Encoding Ascii
 @'
 Use DoubleCommanderPortable.exe at the package root.
-Data\Config stores settings; Data\TraceGuard stores logs.
-If updating, replace App and launcher/metadata but preserve the entire Data folder.
+Data\Config stores settings; Data\Plugins stores new plugins.
+Data\CustomIcons, Data\Highlighters, Data\Scripts and Data\Cache preserve additions.
+The root launcher redirects actual plugin folders to Data. DO NOT run doublecmd.exe directly.
+Before upgrading from v1.0, run the migration helper and back up the current portable folder.
+On upgrades, replace App and launcher but preserve the ENTIRE Data folder.
 This package does not install Explorer integrations, file associations, shortcuts or services.
 WARNING: Any file-operation changes you make inside Double Commander are real and permanent.
 '@ | Set-Content -LiteralPath (Join-Path $Portable 'Other\Help\README.txt') -Encoding UTF8
@@ -129,6 +158,11 @@ $Required = @(
   (Join-Path $AppInfo 'appicon_32.png'),
   (Join-Path $Portable 'Data\Config'),
   (Join-Path $Portable 'Data\TraceGuard'),
+  (Join-Path $Portable 'Data\Plugins'),
+  (Join-Path $Portable 'Data\CustomIcons'),
+  (Join-Path $Portable 'Data\Highlighters'),
+  (Join-Path $Portable 'Data\Scripts'),
+  (Join-Path $Program '_BundledAssets'),
   (Join-Path $Portable 'Other\Help\README.txt')
 )
 foreach ($Item in $Required) { if (!(Test-Path -LiteralPath $Item)) { throw "Package missing expected item: $Item" } }

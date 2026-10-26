@@ -14,6 +14,21 @@ jobs:
       - name: Check out standalone builder repository
         uses: actions/checkout@v4
 
+      - name: Check upgrade protection files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @(
+            'launcher/DoubleCommanderPortable.cpp',
+            'scripts/build.ps1',
+            'scripts/Migrate-v1.0-Addons.ps1',
+            'Migrate-v1.0-Addons.cmd'
+          ) | ForEach-Object { if (!(Test-Path $_)) { throw "Missing upgrade protection file: $_" } }
+          $code = Get-Content 'launcher/DoubleCommanderPortable.cpp' -Raw
+          foreach ($key in @('PrepareManagedFolder', 'SyncOfficialFiles', 'Data', 'FinishManagedFolder')) {
+            if (!$code.Contains($key)) { throw "Missing folder protection routine: $key" }
+          }
+
       - name: Build pinned Double Commander portable package
         shell: pwsh
         run: |
