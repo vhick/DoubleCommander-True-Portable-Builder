@@ -1,0 +1,30 @@
+name: Build Double Commander True Portable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  portable-win64:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - name: Check out standalone builder repository
+        uses: actions/checkout@v4
+
+      - name: Build pinned Double Commander portable package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/build.ps1
+
+      - name: Upload portable ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoubleCommanderPortable-v1.2.9-win64
+          path: dist/DoubleCommanderPortable-v1.2.9-win64.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

@@ -1,0 +1,7 @@
+_work/
+dist/
+.vs/
+*.obj
+*.res
+*.zip
+!.github/**
