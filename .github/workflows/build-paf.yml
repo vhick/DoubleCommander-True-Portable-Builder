@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Optional custom NEW tag. Blank = automatic portable-vVERSION-doublecommander-nsis-r1'
+        description: 'Optional NEW tag matching detected version (e.g. portable-v1.2.10-doublecommander-nsis-r3). Blank = auto r2'
         required: false
         default: ''
         type: string
@@ -36,6 +36,7 @@ jobs:
       sha256: ${{ steps.upstream.outputs.sha256 }}
       download_url: ${{ steps.upstream.outputs.download_url }}
       release_tag: ${{ steps.upstream.outputs.release_tag }}
+      package_revision: ${{ steps.upstream.outputs.package_revision }}
       should_build: ${{ steps.upstream.outputs.should_build }}
       publish_requested: ${{ steps.upstream.outputs.publish_requested }}
     steps:
@@ -54,11 +55,17 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $release = & ./scripts/resolve-release.ps1
           $version = [string]$release.version
-          $tag = "portable-v$version-doublecommander-nsis-r1"
+          $tag = "portable-v$version-doublecommander-nsis-r2"
           if (-not [string]::IsNullOrWhiteSpace($env:INPUT_TAG)) {
             $tag = $env:INPUT_TAG.Trim()
           }
-          if ($tag -notmatch '^portable-[A-Za-z0-9._-]+$') { throw "Unsafe release tag: $tag" }
+          # The release tag must name the exact upstream version being packaged.
+          # A custom revision (r3, r4...) is allowed, but a false version label is not.
+          $pattern = '^portable-v' + [regex]::Escape($version) + '-doublecommander-nsis-(r[1-9][0-9]*)$'
+          if ($tag -cnotmatch $pattern) {
+            throw "Release tag '$tag' does not match detected Double Commander v$version. Expected portable-v$version-doublecommander-nsis-rN."
+          }
+          $packageRevision = [regex]::Match($tag, $pattern).Groups[1].Value
           $publish = ($env:EVENT_KIND -ne 'workflow_dispatch' -or $env:INPUT_PUBLISH -ne 'false')
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
@@ -78,17 +85,22 @@ jobs:
           $exists = ($existingRelease.StatusCode -eq 200 -or $existingGitTag.StatusCode -eq 200)
           $shouldBuild = (-not $exists -or -not $publish)
           if ($exists -and $publish) {
-            Write-Host "Already published: $tag. Skipping Windows build to save runner minutes."
+            Write-Host "Release tag '$tag' already exists. Skipping to protect its assets and avoid unnecessary Windows runner minutes."
+            Write-Host "To deliberately rebuild the same upstream version, run manually with a NEW revision, e.g. portable-v$version-doublecommander-nsis-r3."
           }
           @(
             "version=$version"
             "sha256=$($release.sha256)"
             "download_url=$($release.download_url)"
             "release_tag=$tag"
+            "package_revision=$packageRevision"
             "publish_requested=$($publish.ToString().ToLowerInvariant())"
             "should_build=$($shouldBuild.ToString().ToLowerInvariant())"
           ) | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
-          "Double Commander upstream: v$version; publish=$publish; build=$shouldBuild; tag=$tag" | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "Double Commander upstream: v$version; publish=$publish; build=$shouldBuild; tag=$tag; package_revision=$packageRevision" | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($exists -and $publish) {
+            "Skipped safely: GitHub already has tag $tag. Use a NEW matching rN revision to rebuild." | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
 
   package:
     needs: discover
@@ -99,6 +111,7 @@ jobs:
       DOUBLECMD_VERSION: ${{ needs.discover.outputs.version }}
       DOUBLECMD_SHA256: ${{ needs.discover.outputs.sha256 }}
       DOUBLECMD_DOWNLOAD_URL: ${{ needs.discover.outputs.download_url }}
+      PACKAGE_REVISION: ${{ needs.discover.outputs.package_revision }}
     steps:
       - name: Check out existing portable builder
         uses: actions/checkout@v4
@@ -158,7 +171,7 @@ jobs:
           output-dir: dist
           engine: custom-nsis
           running-exe: 'App\DoubleCommander\doublecmd.exe'
-          package-revision: r1
+          package-revision: ${{ needs.discover.outputs.package_revision }}
 
       - name: Check package count and generate SHA-256 manifest
         shell: pwsh
@@ -169,7 +182,7 @@ jobs:
           if ($zip.Count -ne 1 -or $paf.Count -ne 1) {
             throw "Expected one ZIP and one PAF (ZIP=$($zip.Count), PAF=$($paf.Count))."
           }
-          if ($paf[0].Name -notlike "DoubleCommanderPortable_$($env:DOUBLECMD_VERSION).0_custom-nsis-r1.paf.exe") {
+          if ($paf[0].Name -cne "DoubleCommanderPortable_$($env:DOUBLECMD_VERSION).0_custom-nsis-$($env:PACKAGE_REVISION).paf.exe") {
             throw "Unexpected PAF filename: $($paf[0].Name)"
           }
           foreach ($file in @($zip[0], $paf[0])) {
