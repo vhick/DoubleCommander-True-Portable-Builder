@@ -1,92 +1,139 @@
-# Double Commander v1.2.9 - build ZIP and independent NSIS PortableApps-style installer.
-# Add as .github/workflows/build-paf.yml in vhick/DoubleCommander-True-Portable-Builder.
-# Uses existing scripts/build.ps1 unchanged; does NOT depend on a prior GitHub Release.
-# NOTE: The generated .paf.exe is independent NSIS, not an official PortableApps.com Installer.
-name: Build Double Commander Portable ZIP and PAF
+# Latest official Double Commander portable ZIP -> compiled native launcher -> NSIS PAF.
+# The existing C++ launcher, app-data protection, migration helpers stay untouched.
+# Custom NSIS is independent, NOT the official PortableApps.com Installer.
+name: Build Double Commander Portable ZIP and PAF (Auto Latest)
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'New release tag (use a fresh tag for each changed build)'
-        required: true
+        description: 'Optional custom NEW tag. Blank = automatic portable-vVERSION-doublecommander-nsis-r1'
+        required: false
+        default: ''
         type: string
-        default: portable-v1.2.9-doublecommander-nsis-r1
       publish:
-        description: 'Publish both ZIP and independent NSIS PAF to GitHub Releases'
+        description: 'Publish verified ZIP and PAF to GitHub Releases'
         required: true
         type: boolean
         default: true
+  schedule:
+    # Weekly upstream check. UTC Monday 05:17; auto-publish only when version is new.
+    - cron: '17 5 * * 1'
 
 permissions:
   contents: write
 
 concurrency:
-  group: doublecommander-paf-${{ github.ref }}-${{ inputs.release_tag }}
+  group: doublecommander-paf-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  package:
-    runs-on: windows-2022
-    timeout-minutes: 60
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.upstream.outputs.version }}
+      sha256: ${{ steps.upstream.outputs.sha256 }}
+      download_url: ${{ steps.upstream.outputs.download_url }}
+      release_tag: ${{ steps.upstream.outputs.release_tag }}
+      should_build: ${{ steps.upstream.outputs.should_build }}
+      publish_requested: ${{ steps.upstream.outputs.publish_requested }}
     steps:
-      - name: Checkout existing Double Commander builder
+      - name: Check out builder
         uses: actions/checkout@v4
 
-      - name: Refuse unsafe or already published release tag
-        if: inputs.publish
+      - name: Resolve latest official release and prevent redundant builds
+        id: upstream
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_TAG: ${{ inputs.release_tag }}
+          EVENT_KIND: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:TARGET_TAG -notmatch '^portable-[A-Za-z0-9._-]+$') {
-            throw 'Release tag must start with portable- and contain only letters, numbers, periods, underscores or hyphens.'
+          $release = & ./scripts/resolve-release.ps1
+          $version = [string]$release.version
+          $tag = "portable-v$version-doublecommander-nsis-r1"
+          if (-not [string]::IsNullOrWhiteSpace($env:INPUT_TAG)) {
+            $tag = $env:INPUT_TAG.Trim()
           }
-          $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TARGET_TAG"
-          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
-          $response = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck -TimeoutSec 30
-          if ($response.StatusCode -eq 200) {
-            throw "Release $env:TARGET_TAG already exists. Choose a new release_tag instead of overwriting it."
+          if ($tag -notmatch '^portable-[A-Za-z0-9._-]+$') { throw "Unsafe release tag: $tag" }
+          $publish = ($env:EVENT_KIND -ne 'workflow_dispatch' -or $env:INPUT_PUBLISH -ne 'false')
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
           }
-          if ($response.StatusCode -ne 404) {
-            throw "Cannot safely verify release tag (GitHub API status: $($response.StatusCode))."
+          $encodedTag = [uri]::EscapeDataString($tag)
+          $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $existingRelease = Invoke-WebRequest -Uri "$base/releases/tags/$encodedTag" -Headers $headers -SkipHttpErrorCheck -TimeoutSec 30
+          if ($existingRelease.StatusCode -notin @(200,404)) {
+            throw "Cannot safely check existing release tag: HTTP $($existingRelease.StatusCode)"
           }
+          $existingGitTag = Invoke-WebRequest -Uri "$base/git/ref/tags/$encodedTag" -Headers $headers -SkipHttpErrorCheck -TimeoutSec 30
+          if ($existingGitTag.StatusCode -notin @(200,404)) {
+            throw "Cannot safely check existing Git tag: HTTP $($existingGitTag.StatusCode)"
+          }
+          $exists = ($existingRelease.StatusCode -eq 200 -or $existingGitTag.StatusCode -eq 200)
+          $shouldBuild = (-not $exists -or -not $publish)
+          if ($exists -and $publish) {
+            Write-Host "Already published: $tag. Skipping Windows build to save runner minutes."
+          }
+          @(
+            "version=$version"
+            "sha256=$($release.sha256)"
+            "download_url=$($release.download_url)"
+            "release_tag=$tag"
+            "publish_requested=$($publish.ToString().ToLowerInvariant())"
+            "should_build=$($shouldBuild.ToString().ToLowerInvariant())"
+          ) | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          "Double Commander upstream: v$version; publish=$publish; build=$shouldBuild; tag=$tag" | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Check existing v1.1 upgrade-protection code
+  package:
+    needs: discover
+    if: needs.discover.outputs.should_build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      DOUBLECMD_VERSION: ${{ needs.discover.outputs.version }}
+      DOUBLECMD_SHA256: ${{ needs.discover.outputs.sha256 }}
+      DOUBLECMD_DOWNLOAD_URL: ${{ needs.discover.outputs.download_url }}
+    steps:
+      - name: Check out existing portable builder
+        uses: actions/checkout@v4
+
+      - name: Check existing upgrade-protection source files
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           @(
             'launcher/DoubleCommanderPortable.cpp',
             'scripts/build.ps1',
+            'scripts/resolve-release.ps1',
+            'scripts/verified-hashes.json',
             'scripts/Migrate-v1.0-Addons.ps1',
             'Migrate-v1.0-Addons.cmd'
           ) | ForEach-Object {
-            if (!(Test-Path -LiteralPath $_ -PathType Leaf)) {
-              throw "Missing v1.1 protection file: $_"
-            }
+            if (!(Test-Path -LiteralPath $_ -PathType Leaf)) { throw "Required existing file missing: $_" }
           }
-          $code = Get-Content -LiteralPath 'launcher/DoubleCommanderPortable.cpp' -Raw
-          foreach ($routine in @('PrepareManagedFolder', 'SyncOfficialFiles', 'Data', 'FinishManagedFolder')) {
-            if (!$code.Contains($routine)) {
-              throw "Missing critical portable-folder protection routine: $routine"
-            }
+          $cpp = Get-Content -LiteralPath 'launcher/DoubleCommanderPortable.cpp' -Raw
+          foreach ($key in @('PrepareManagedFolder','SyncOfficialFiles','Data','FinishManagedFolder')) {
+            if (!$cpp.Contains($key)) { throw "Critical native-launcher protection absent: $key" }
           }
 
-      - name: Build existing verified Double Commander ZIP and native launcher
+      - name: Compile launcher and build latest Double Commander ZIP
+        shell: pwsh
+        run: ./scripts/build.ps1
+
+      - name: Verify ZIP, AppInfo version and layout
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          ./scripts/build.ps1
-
-      - name: Verify the new ZIP and PortableApps source directory
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
+          $version = $env:DOUBLECMD_VERSION
           $root = '_work/DoubleCommanderPortable'
-          $required = @(
+          $zip = "dist/DoubleCommanderPortable-v$version-win64.zip"
+          @(
             "$root/DoubleCommanderPortable.exe",
             "$root/App/DoubleCommander/doublecmd.exe",
             "$root/App/AppInfo/appinfo.ini",
@@ -95,14 +142,14 @@ jobs:
             "$root/Data/Config",
             "$root/Data/Plugins",
             "$root/Data/TraceGuard",
-            'dist/DoubleCommanderPortable-v1.2.9-win64.zip'
-          )
-          foreach ($item in $required) {
-            if (!(Test-Path -LiteralPath $item)) { throw "Missing packaged item: $item" }
+            $zip
+          ) | ForEach-Object { if (!(Test-Path -LiteralPath $_)) { throw "Missing: $_" } }
+          $appInfo = Get-Content -LiteralPath "$root/App/AppInfo/appinfo.ini" -Raw
+          if (!$appInfo.Contains("PackageVersion=$version.0") -or !$appInfo.Contains("DisplayVersion=$version")) {
+            throw "AppInfo does not contain the resolved v$version"
           }
-          $zip = 'dist/DoubleCommanderPortable-v1.2.9-win64.zip'
-          if ((Get-Item -LiteralPath $zip).Length -lt 10240) { throw 'Final ZIP is unexpectedly small.' }
-          Write-Host 'Existing builder output passed basic file checks.'
+          if ((Get-Item -LiteralPath $zip).Length -lt 1000000) { throw 'Portable ZIP too small.' }
+          if (@(Get-ChildItem -LiteralPath dist -Filter '*.zip' -File).Count -ne 1) { throw 'Expected one ZIP only.' }
 
       - name: Build independent headless NSIS installer
         uses: vhick/portable-package-builder@v1.0.0
@@ -113,37 +160,44 @@ jobs:
           running-exe: 'App\DoubleCommander\doublecmd.exe'
           package-revision: r1
 
-      - name: Verify installer was produced
+      - name: Check package count and generate SHA-256 manifest
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $files = @(Get-ChildItem -LiteralPath dist -File -Filter 'DoubleCommanderPortable_*_custom-nsis-r1.paf.exe')
-          if ($files.Count -ne 1) {
-            throw "Expected exactly one NSIS .paf.exe, found $($files.Count)."
+          $zip = @(Get-ChildItem -LiteralPath dist -File -Filter '*.zip')
+          $paf = @(Get-ChildItem -LiteralPath dist -File -Filter '*.paf.exe')
+          if ($zip.Count -ne 1 -or $paf.Count -ne 1) {
+            throw "Expected one ZIP and one PAF (ZIP=$($zip.Count), PAF=$($paf.Count))."
           }
-          Write-Host "Installer ready: $($files[0].Name)"
+          if ($paf[0].Name -notlike "DoubleCommanderPortable_$($env:DOUBLECMD_VERSION).0_custom-nsis-r1.paf.exe") {
+            throw "Unexpected PAF filename: $($paf[0].Name)"
+          }
+          foreach ($file in @($zip[0], $paf[0])) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "$($file.Name) $hash"
+          }
 
-      - name: Verify release assets and SHA-256 checksums (dry run)
+      - name: Shared publisher preflight (no release created)
         uses: vhick/portable-release-publisher@v1.1.1
         with:
           files: |
-            dist/DoubleCommanderPortable-v1.2.9-win64.zip
+            dist/*.zip
             dist/*.paf.exe
-          tag: ${{ inputs.release_tag }}
-          release-title: Double Commander Portable v1.2.9 (ZIP + Independent NSIS)
+          tag: ${{ needs.discover.outputs.release_tag }}
+          release-title: Double Commander Portable v${{ needs.discover.outputs.version }} (ZIP + Independent NSIS)
           keep-releases: '3'
           prune: 'false'
           dry-run: 'true'
 
-      - name: Publish ZIP and independent NSIS installer to Releases
-        if: inputs.publish
+      - name: Publish through existing shared release publisher
+        if: needs.discover.outputs.publish_requested == 'true'
         uses: vhick/portable-release-publisher@v1.1.1
         with:
           files: |
-            dist/DoubleCommanderPortable-v1.2.9-win64.zip
+            dist/*.zip
             dist/*.paf.exe
-          tag: ${{ inputs.release_tag }}
-          release-title: Double Commander Portable v1.2.9 (ZIP + Independent NSIS)
+          tag: ${{ needs.discover.outputs.release_tag }}
+          release-title: Double Commander Portable v${{ needs.discover.outputs.version }} (ZIP + Independent NSIS)
           keep-releases: '3'
           prune: 'false'
           dry-run: 'false'

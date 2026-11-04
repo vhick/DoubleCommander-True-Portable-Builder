@@ -1,11 +1,26 @@
 #requires -Version 5.1
 # Build a PortableApps-friendly package from the OFFICIAL portable ZIP, with a native launcher.
-# Pinning checksum is intentional: update the version and hash together when upgrading.
+# The release is resolved at runtime from the official upstream sources.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-
-$Version = '1.2.9'
-$Sha256 = 'e8472c0105dbde55db4ffbdbd190eab65e9da0375596454995fae4a1fc128dee'
+if ($env:DOUBLECMD_VERSION -and $env:DOUBLECMD_SHA256 -and $env:DOUBLECMD_DOWNLOAD_URL) {
+    $Version = $env:DOUBLECMD_VERSION
+    $Sha256 = $env:DOUBLECMD_SHA256.ToLowerInvariant()
+    $DownloadUrl = $env:DOUBLECMD_DOWNLOAD_URL
+} else {
+    $Release = & (Join-Path $PSScriptRoot 'resolve-release.ps1')
+    $Version = [string]$Release.version
+    $Sha256 = [string]$Release.sha256
+    $DownloadUrl = [string]$Release.download_url
+}
+if ($Version -notmatch '^\d+\.\d+\.\d+$' -or $Sha256 -notmatch '^[0-9a-f]{64}$') {
+    throw 'Invalid resolved upstream release/version/checksum.'
+}
+$ExpectedGitHub = "https://github.com/doublecmd/doublecmd/releases/download/v$Version/doublecmd-$Version.x86_64-win64.zip"
+$ExpectedSourceForge = "https://downloads.sourceforge.net/project/doublecmd/Double%20Commander/v$Version/doublecmd-$Version.x86_64-win64.zip"
+if ($DownloadUrl -cne $ExpectedGitHub -and $DownloadUrl -cne $ExpectedSourceForge) {
+    throw 'Untrusted upstream download URL. Only the official release URL patterns are accepted.'
+}
 $Repository = Split-Path -Parent $PSScriptRoot
 $Work = Join-Path $Repository '_work'
 $Dist = Join-Path $Repository 'dist'
@@ -13,19 +28,19 @@ $Portable = Join-Path $Work 'DoubleCommanderPortable'
 $Program = Join-Path $Portable 'App\DoubleCommander'
 $AppInfo = Join-Path $Portable 'App\AppInfo'
 $Archive = Join-Path $Work "doublecmd-$Version.x86_64-win64.zip"
-$DownloadUrl = "https://github.com/doublecmd/doublecmd/releases/download/v$Version/doublecmd-$Version.x86_64-win64.zip"
-
+# The exact download URL is selected by official upstream metadata.
 if (Test-Path $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Work, $Dist, $Portable, $Program, $AppInfo, (Join-Path $Portable 'Data\Config'), (Join-Path $Portable 'Data\TraceGuard'), (Join-Path $Portable 'Other\Help') | Out-Null
 # Keep the initially empty Data subdirectories in the generated ZIP.
 Set-Content -LiteralPath (Join-Path $Portable 'Data\Config\.keep') -Value '' -NoNewline -Encoding Ascii
 Set-Content -LiteralPath (Join-Path $Portable 'Data\TraceGuard\.keep') -Value '' -NoNewline -Encoding Ascii
 Write-Host "Downloading official Double Commander $Version portable release"
-Invoke-WebRequest -Uri $DownloadUrl -OutFile $Archive -MaximumRedirection 10
+Write-Host "Official source: $DownloadUrl"
+Invoke-WebRequest -Uri $DownloadUrl -OutFile $Archive -MaximumRedirection 10 -TimeoutSec 180 -Headers @{ 'User-Agent' = 'DoubleCommanderTruePortableBuilder/auto-latest' }
+if ((Get-Item -LiteralPath $Archive).Length -lt 5000000) { throw 'Upstream ZIP is unexpectedly small or is not a valid download.' }
 $Actual = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($Actual -ne $Sha256) { throw "Official archive SHA-256 mismatch: got $Actual, expected $Sha256. Stop; do not bypass verification." }
 Write-Host "Official release SHA-256 verified: $Actual"
-
 $Unpack = Join-Path $Work 'unpacked'
 Expand-Archive -LiteralPath $Archive -DestinationPath $Unpack -Force
 $Executables = @(Get-ChildItem -LiteralPath $Unpack -Recurse -Filter 'doublecmd.exe' -File)
@@ -63,7 +78,6 @@ foreach ($Name in $UserFolders.Keys) {
 New-Item -ItemType Directory -Force -Path (Join-Path $Portable 'Data\State'), (Join-Path $Portable 'Data\LegacyAppFolders') | Out-Null
 # The original settings/doublecmd.inf stays in App as a fallback. The launcher overrides
 # settings with --config-dir so ordinary configuration is always in Data\Config.
-
 # Extract the actual, installed application's icon, not a generic replacement.
 Add-Type -AssemblyName System.Drawing
 $Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($DcExe)
@@ -81,7 +95,6 @@ foreach ($size in @(16, 32)) {
     } finally { $Graphics.Dispose(); $Image.Dispose() }
 }
 $Icon.Dispose()
-
 $Ini = @"
 [Format]
 Type=PortableApps.comFormat
@@ -104,9 +117,8 @@ CommercialUse=true
 EULAVersion=1
 
 [Version]
-PackageVersion=1.2.9.0
-DisplayVersion=1.2.9
-
+PackageVersion=$Version.0
+DisplayVersion=$Version
 [Control]
 Icons=1
 Start=DoubleCommanderPortable.exe
@@ -122,7 +134,6 @@ On upgrades, replace App and launcher but preserve the ENTIRE Data folder.
 This package does not install Explorer integrations, file associations, shortcuts or services.
 WARNING: Any file-operation changes you make inside Double Commander are real and permanent.
 '@ | Set-Content -LiteralPath (Join-Path $Portable 'Other\Help\README.txt') -Encoding UTF8
-
 # Compile the launcher in the MSVC developer command prompt supplied by GitHub's Windows runner.
 $Vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (!(Test-Path -LiteralPath $Vswhere)) { throw 'vswhere.exe not found on Windows runner.' }
@@ -147,7 +158,6 @@ $Lines = @(
 Set-Content -LiteralPath $Batch -Value $Lines -Encoding ASCII
 & cmd.exe /d /c "`"$Batch`""
 if ($LASTEXITCODE -ne 0) { throw "Native launcher compilation failed with exit code $LASTEXITCODE." }
-
 # Assert contents prior to packaging. Explicitly verify that the Data folder exists.
 $Required = @(
   $RootLauncher,

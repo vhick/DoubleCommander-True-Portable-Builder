@@ -1,45 +1,94 @@
-name: Build Double Commander True Portable
+# Optional manual ZIP-only workflow. The recommended scheduled PAF+ZIP workflow is build-paf.yml.
+# Publishes to GitHub Releases through the same shared publisher (no Actions artifacts).
+name: Build Double Commander ZIP only (Auto Latest)
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish verified ZIP to a new release (disable for an inspection-only build)'
+        required: true
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  portable-win64:
+  zip:
     runs-on: windows-2022
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
-      - name: Check out standalone builder repository
-        uses: actions/checkout@v4
-
-      - name: Check upgrade protection files
+      - uses: actions/checkout@v4
+      - name: Resolve version and check for existing ZIP-only release
+        id: upstream
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DO_PUBLISH: ${{ inputs.publish }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = & ./scripts/resolve-release.ps1
+          $tag = "portable-v$($release.version)-doublecommander-zip-r1"
+          if ($env:DO_PUBLISH -eq 'true') {
+            $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = 'application/vnd.github+json'
+            }
+            $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+            foreach ($url in @("$base/releases/tags/$tag", "$base/git/ref/tags/$tag")) {
+              $res = Invoke-WebRequest -Uri $url -Headers $headers -SkipHttpErrorCheck -TimeoutSec 30
+              if ($res.StatusCode -eq 200) { throw "Already published: $tag. No overwrite. Run ZIP+PAF or use a new revision." }
+              if ($res.StatusCode -ne 404) { throw "Cannot verify release tag: HTTP $($res.StatusCode)" }
+            }
+          }
+          @(
+            "version=$($release.version)"
+            "sha256=$($release.sha256)"
+            "download_url=$($release.download_url)"
+            "tag=$tag"
+          ) | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+      - name: Check launcher protection source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          @(
-            'launcher/DoubleCommanderPortable.cpp',
-            'scripts/build.ps1',
-            'scripts/Migrate-v1.0-Addons.ps1',
-            'Migrate-v1.0-Addons.cmd'
-          ) | ForEach-Object { if (!(Test-Path $_)) { throw "Missing upgrade protection file: $_" } }
-          $code = Get-Content 'launcher/DoubleCommanderPortable.cpp' -Raw
-          foreach ($key in @('PrepareManagedFolder', 'SyncOfficialFiles', 'Data', 'FinishManagedFolder')) {
-            if (!$code.Contains($key)) { throw "Missing folder protection routine: $key" }
+          foreach ($file in @('launcher/DoubleCommanderPortable.cpp','scripts/build.ps1','scripts/resolve-release.ps1','scripts/Migrate-v1.0-Addons.ps1','Migrate-v1.0-Addons.cmd')) {
+            if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing upgrade protection file $file" }
           }
-
-      - name: Build pinned Double Commander portable package
+          $cpp = Get-Content -LiteralPath launcher/DoubleCommanderPortable.cpp -Raw
+          foreach ($key in @('PrepareManagedFolder','SyncOfficialFiles','Data','FinishManagedFolder')) {
+            if (!$cpp.Contains($key)) { throw "Missing critical launcher protection: $key" }
+          }
+      - name: Build latest official ZIP
         shell: pwsh
+        env:
+          DOUBLECMD_VERSION: ${{ steps.upstream.outputs.version }}
+          DOUBLECMD_SHA256: ${{ steps.upstream.outputs.sha256 }}
+          DOUBLECMD_DOWNLOAD_URL: ${{ steps.upstream.outputs.download_url }}
         run: |
           $ErrorActionPreference = 'Stop'
           ./scripts/build.ps1
-
-      - name: Upload portable ZIP artifact
-        uses: actions/upload-artifact@v4
+          $zips = @(Get-ChildItem -LiteralPath dist -File -Filter '*.zip')
+          if ($zips.Count -ne 1 -or $zips[0].Name -ne "DoubleCommanderPortable-v$env:DOUBLECMD_VERSION-win64.zip") {
+            throw 'Expected exactly one ZIP with the detected version.'
+          }
+          Write-Host "Validated: $($zips[0].Name)"
+      - name: Shared publisher preflight
+        uses: vhick/portable-release-publisher@v1.1.1
         with:
-          name: DoubleCommanderPortable-v1.2.9-win64
-          path: dist/DoubleCommanderPortable-v1.2.9-win64.zip
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
+          files: dist/*.zip
+          tag: ${{ steps.upstream.outputs.tag }}
+          release-title: Double Commander Portable v${{ steps.upstream.outputs.version }} (ZIP Only)
+          keep-releases: '3'
+          prune: 'false'
+          dry-run: 'true'
+      - name: Publish ZIP through shared publisher
+        if: inputs.publish
+        uses: vhick/portable-release-publisher@v1.1.1
+        with:
+          files: dist/*.zip
+          tag: ${{ steps.upstream.outputs.tag }}
+          release-title: Double Commander Portable v${{ steps.upstream.outputs.version }} (ZIP Only)
+          keep-releases: '3'
+          prune: 'false'
+          dry-run: 'false'
